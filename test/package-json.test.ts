@@ -203,17 +203,38 @@ describe("parsePackageJson: package URLs", () => {
     expect(component(scan({ dependencies: { JSONStream: "1.3.5" } }), "JSONStream").purl).toBe("pkg:npm/JSONStream@1.3.5");
   });
 
-  it("percent-encodes characters encodeURIComponent would leave alone", () => {
-    // encodeURIComponent leaves !'()* intact; ECMA-427 clause 5.2 does not
-    // permit them in a PURL component.
-    expect(component(scan({ dependencies: { "pkg!'()*": "1.0.0" } }), "pkg!'()*").purl).toBe(
-      "pkg:npm/pkg%21%27%28%29%2A@1.0.0",
-    );
+  it.each([
+    ["contains an exclamation mark", "bad!name"],
+    ["contains characters npm forbids", "pkg!'()*"],
+    ["contains a tilde", "pkg~name"],
+    ["contains a space", "pkg name"],
+    ["has more than one slash", "@scope/a/b"],
+    ["starts with a period", ".hidden"],
+    ["starts with an underscore", "_private"],
+    ["is longer than npm allows", "a".repeat(215)],
+    ["has an empty scope", "@/name"],
+  ])("gives no package URL to a name that %s", (_label, name) => {
+    // No such package can exist in the registry, so a package URL naming one
+    // would be an identifier that resolves to nothing.
+    expect(component(scan({ dependencies: { [name]: "1.0.0" } }), name).purl).toBeNull();
   });
 
-  it("gives no package URL to a name that is not a well-formed npm name", () => {
-    expect(component(scan({ dependencies: { "@scope/a/b": "1.0.0" } }), "@scope/a/b").purl).toBeNull();
+  it.each(["qs", "JSONStream", "lodash.merge", "@hono/node-server", "a".repeat(214)])(
+    "gives a package URL to the valid name %s",
+    (name) => {
+      expect(component(scan({ dependencies: { [name]: "1.0.0" } }), name).purl).not.toBeNull();
+    },
+  );
+
+  it("still lists a component whose name npm would reject, without a package URL", () => {
+    // The manifest said it, so the readout says it. Only the identifier claim
+    // is withheld.
+    const result = component(scan({ dependencies: { "bad!name": "^1.0.0" } }), "bad!name");
+    expect(result.name).toBe("bad!name");
+    expect(result.declaredRange).toBe("^1.0.0");
+    expect(result.purl).toBeNull();
   });
+
 });
 
 describe("parsePackageJson: workspaces", () => {

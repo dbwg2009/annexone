@@ -21,14 +21,25 @@ const addFormats = ((addFormatsModule as unknown as { default?: unknown }).defau
 function newAjv(): InstanceType<typeof Ajv> {
   const ajv = new Ajv({ strict: false, allErrors: true });
   addFormats(ajv);
-  // Neither format is implemented by ajv-formats. They are registered
-  // permissively so that their absence cannot silently disable validation of
-  // the surrounding schema; nothing here claims to check IRI or IDN syntax.
-  ajv.addFormat("iri-reference", true);
-  ajv.addFormat("iri", true);
-  ajv.addFormat("idn-email", true);
-  ajv.addFormat("idn-hostname", true);
+  // ajv-formats implements no internationalised format, and registering these
+  // as always-pass would quietly switch off validation of the CycloneDX fields
+  // that use them. Their ASCII counterparts are used instead: every URI is an
+  // IRI and every ASCII address is an IDN address, so this is strictly stronger
+  // than a stub and exact for everything this project emits, which is ASCII by
+  // construction. It would wrongly reject a genuinely non-ASCII IRI; nothing
+  // here produces one, and a stub that accepts anything is the worse trade.
+  alias(ajv, "iri-reference", "uri-reference");
+  alias(ajv, "iri", "uri");
+  alias(ajv, "idn-email", "email");
+  alias(ajv, "idn-hostname", "hostname");
   return ajv;
+}
+
+/** Registers an existing ajv-formats validator under a second name. */
+function alias(ajv: InstanceType<typeof Ajv>, name: string, existing: string): void {
+  const format = ajv.formats[existing];
+  if (format === undefined) throw new Error(`ajv-formats does not provide "${existing}"`);
+  ajv.addFormat(name, format);
 }
 
 function compileCycloneDx() {

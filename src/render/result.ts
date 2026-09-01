@@ -116,6 +116,9 @@ function componentTable(components: readonly Component[]) {
   `;
 }
 
+/** Why a component carries no package URL. */
 function sourceNote(component: Component): string {
-  return component.source === "alias" ? "aliases another package" : "not from the registry";
+  if (component.source === "alias") return "aliases another package";
+  if (component.source === "other") return "not from the registry";
+  return "not a name npm would accept";
 }

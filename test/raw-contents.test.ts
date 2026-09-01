@@ -5,12 +5,13 @@ import type { RepoRef } from "../src/github/repo-ref.js";
 const REF: RepoRef = { owner: "expressjs", repo: "express" };
 const URL_FOR_REF = "https://raw.githubusercontent.com/expressjs/express/HEAD/package.json";
 
-function responding(response: Response | (() => never)): FetchDeps {
+function responding(response: Response | (() => never), now?: Date): FetchDeps {
   return {
     fetch: vi.fn(async () => {
       if (typeof response === "function") response();
       return response;
     }) as unknown as typeof globalThis.fetch,
+    ...(now === undefined ? {} : { now: () => now }),
   };
 }
 
@@ -65,11 +66,28 @@ describe("fetchManifest", () => {
     expect(result).toEqual({ ok: false, error: { kind: "rate-limited", retryAfterSeconds: 60 } });
   });
 
+  it("converts the HTTP-date form of Retry-After into a delay", async () => {
+    // RFC 9110 allows both forms. Understanding only delay-seconds would have
+    // the page say GitHub did not say when to retry in cases where it did.
+    const now = new Date("2026-10-21T07:00:00Z");
+    const response = new Response("", { status: 429, headers: { "retry-after": "Wed, 21 Oct 2026 07:28:00 GMT" } });
+    const result = await fetchManifest(REF, "package.json", responding(response, now));
+    expect(result).toEqual({ ok: false, error: { kind: "rate-limited", retryAfterSeconds: 28 * 60 } });
+  });
+
+  it("treats an HTTP-date already past as no wait at all", async () => {
+    const now = new Date("2026-10-21T08:00:00Z");
+    const response = new Response("", { status: 429, headers: { "retry-after": "Wed, 21 Oct 2026 07:28:00 GMT" } });
+    const result = await fetchManifest(REF, "package.json", responding(response, now));
+    expect(result).toEqual({ ok: false, error: { kind: "rate-limited", retryAfterSeconds: 0 } });
+  });
+
   it.each([
-    ["an HTTP-date", "Wed, 21 Oct 2026 07:28:00 GMT"],
     ["a non-number", "soon"],
     ["a negative number", "-5"],
+    ["an empty value", "   "],
   ])("says nothing about when to retry when Retry-After is %s", async (_label, header) => {
+    // "-5" must not reach the date branch: Date.parse("-5") is a date in 2001.
     const response = new Response("", { status: 429, headers: { "retry-after": header } });
     const result = await fetchManifest(REF, "package.json", responding(response));
     expect(result).toEqual({ ok: false, error: { kind: "rate-limited", retryAfterSeconds: null } });

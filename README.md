@@ -14,7 +14,7 @@ It produces a document. It does not make anyone compliant, and it is not legal a
 
 ## Running it
 
-```
+```shell
 npm install
 npm run dev          # http://127.0.0.1:8787
 npm test             # parsers and both serialisers

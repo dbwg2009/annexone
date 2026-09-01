@@ -16,7 +16,12 @@ export const META: DocumentMeta = {
 };
 
 export function inventoryFrom(manifest: unknown, repository = "owner/name"): Inventory {
+  // JSON.stringify is typed as returning string but returns undefined for
+  // undefined, a function or a symbol. No caller passes one; rejecting them
+  // here turns a confusing downstream parse failure into a clear one.
   const text = typeof manifest === "string" ? manifest : JSON.stringify(manifest);
+  if (typeof text !== "string") throw new Error(`fixture cannot be serialised: ${String(manifest)}`);
+
   const parsed = parsePackageJson(text);
   if (!parsed.ok) throw new Error(`fixture did not parse: ${parsed.error.detail}`);
 

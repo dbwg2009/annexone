@@ -24,6 +24,8 @@ export type FetchFailure =
 
 export type FetchDeps = {
   readonly fetch: typeof globalThis.fetch;
+  /** Reads the clock, so the HTTP-date form of Retry-After is testable. */
+  readonly now?: () => Date;
   /**
    * Injected rather than imported, so the module runs under a plain test
    * runner where the Workers Cache API does not exist.
@@ -69,8 +71,10 @@ export function manifestUrl(ref: RepoRef, path: string): string {
 export async function fetchManifest(ref: RepoRef, path: string, deps: FetchDeps): Promise<Result<string, FetchFailure>> {
   const url = manifestUrl(ref, path);
 
+  const now = deps.now?.() ?? new Date();
+
   const cached = await readCache(deps.cache, url);
-  if (cached !== null) return interpret(cached, ref, path);
+  if (cached !== null) return interpret(cached, ref, path, now);
 
   let response: Response;
   try {
@@ -83,7 +87,7 @@ export async function fetchManifest(ref: RepoRef, path: string, deps: FetchDeps)
     return err({ kind: "network-error", detail: cause instanceof Error ? cause.message : String(cause) });
   }
 
-  const outcome = await interpret(response, ref, path);
+  const outcome = await interpret(response, ref, path, now);
 
   // Cached after interpreting, and only when the answer is one worth repeating.
   // A rate-limited or failing upstream is a moment, not a fact about the
@@ -101,10 +105,15 @@ export async function fetchManifest(ref: RepoRef, path: string, deps: FetchDeps)
 }
 
 /** Maps one response, cached or live, onto the outcome it represents. */
-async function interpret(response: Response, ref: RepoRef, path: string): Promise<Result<string, FetchFailure>> {
+async function interpret(
+  response: Response,
+  ref: RepoRef,
+  path: string,
+  now: Date,
+): Promise<Result<string, FetchFailure>> {
   if (response.status === 404) return err({ kind: "not-found", ref, path });
   if (response.status === 429 || response.status === 403) {
-    return err({ kind: "rate-limited", retryAfterSeconds: retryAfter(response) });
+    return err({ kind: "rate-limited", retryAfterSeconds: retryAfter(response, now) });
   }
   if (!response.ok) return err({ kind: "upstream-error", status: response.status });
   return readBounded(response);
@@ -177,15 +186,31 @@ function concat(chunks: readonly Uint8Array[], total: number): Uint8Array {
 }
 
 /**
- * Reads Retry-After. Only the delay-seconds form is understood; the HTTP-date
- * form yields null, and the page then says nothing about when to retry rather
- * than guessing.
+ * Reads Retry-After in both forms RFC 9110 defines: delay-seconds, and an
+ * HTTP-date converted to a delay against the clock. Understanding only the
+ * first would have the page say "GitHub did not say when to retry" in cases
+ * where GitHub did say -- a false statement, not merely a missing one.
+ *
+ * A date already past yields 0: the wait is over, not negative.
  */
-function retryAfter(response: Response): number | null {
+function retryAfter(response: Response, now: Date): number | null {
   const header = response.headers.get("retry-after");
   if (header === null) return null;
-  const seconds = Number(header.trim());
-  return Number.isInteger(seconds) && seconds >= 0 ? seconds : null;
+
+  const trimmed = header.trim();
+  if (trimmed.length === 0) return null;
+
+  // Anything purely numeric is a delay-seconds value, well formed or not. It
+  // must never reach the date branch: Date.parse("-5") is a date in 2001, so a
+  // malformed delay would otherwise become a confident and wrong answer.
+  if (/^[+-]?\d+$/.test(trimmed)) {
+    const seconds = Number(trimmed);
+    return Number.isSafeInteger(seconds) && seconds >= 0 ? seconds : null;
+  }
+
+  const at = Date.parse(trimmed);
+  if (Number.isNaN(at)) return null;
+  return Math.max(0, Math.round((at - now.getTime()) / 1000));
 }
 
 async function readCache(cache: Cache | undefined, url: string): Promise<Response | null> {

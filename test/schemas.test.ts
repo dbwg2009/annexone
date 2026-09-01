@@ -39,6 +39,37 @@ describe("vendored schemas", () => {
     expect(cycloneDx16Errors(withGoodLicence)).toEqual([]);
   });
 
+  it("validates the formats CycloneDX declares, rather than waving them through", () => {
+    // ajv-formats implements no internationalised format. Registering
+    // iri-reference as always-pass would leave every URL in a CycloneDX
+    // document unchecked while the suite still claimed schema conformance.
+    const withMalformedUrl = {
+      bomFormat: "CycloneDX",
+      specVersion: "1.6",
+      metadata: {
+        component: {
+          type: "application",
+          name: "x",
+          externalReferences: [{ type: "vcs", url: "http://[not a url" }],
+        },
+      },
+    };
+    expect(cycloneDx16Errors(withMalformedUrl).join(" ")).toContain("iri-reference");
+
+    const withValidUrl = {
+      bomFormat: "CycloneDX",
+      specVersion: "1.6",
+      metadata: {
+        component: {
+          type: "application",
+          name: "x",
+          externalReferences: [{ type: "vcs", url: "https://github.com/expressjs/express" }],
+        },
+      },
+    };
+    expect(cycloneDx16Errors(withValidUrl)).toEqual([]);
+  });
+
   it("accepts a minimal SPDX 2.3 document", () => {
     const document = {
       spdxVersion: "SPDX-2.3",
