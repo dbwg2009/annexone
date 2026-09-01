@@ -12,7 +12,15 @@ export type FetchFailure =
   | { readonly kind: "rate-limited"; readonly retryAfterSeconds: number | null }
   | { readonly kind: "upstream-error"; readonly status: number }
   | { readonly kind: "network-error"; readonly detail: string }
-  | { readonly kind: "manifest-too-large"; readonly bytes: number };
+  | {
+      readonly kind: "manifest-too-large";
+      /**
+       * The length the response declared, or null where it declared none and
+       * the read was abandoned at the limit. Null means the true size is
+       * unknown and greater than the limit -- not that it is unknowable.
+       */
+      readonly declaredBytes: number | null;
+    };
 
 export type FetchDeps = {
   readonly fetch: typeof globalThis.fetch;
@@ -25,9 +33,11 @@ export type FetchDeps = {
 
 /**
  * A package.json larger than this is not a manifest we are willing to read into
- * memory on a free tier.
+ * memory on a free tier. Enforced while reading, not after: a Worker has a
+ * small memory ceiling, so a body that would breach it must never be buffered
+ * whole in order to discover that it breaches it.
  */
-const MAX_BYTES = 2 * 1024 * 1024;
+export const MAX_MANIFEST_BYTES = 2 * 1024 * 1024;
 
 /**
  * How long a fetched manifest stays in the edge cache. GitHub allows 60
@@ -60,7 +70,7 @@ export async function fetchManifest(ref: RepoRef, path: string, deps: FetchDeps)
   const url = manifestUrl(ref, path);
 
   const cached = await readCache(deps.cache, url);
-  if (cached !== null) return fromResponse(cached, ref, path);
+  if (cached !== null) return interpret(cached, ref, path);
 
   let response: Response;
   try {
@@ -73,39 +83,97 @@ export async function fetchManifest(ref: RepoRef, path: string, deps: FetchDeps)
     return err({ kind: "network-error", detail: cause instanceof Error ? cause.message : String(cause) });
   }
 
-  // Only settled answers are cached. A rate-limited or failing upstream is a
-  // moment, not a fact about the repository, and caching it would strand every
-  // later visitor on the same error.
-  if (response.status === 200 || response.status === 404) {
-    await writeCache(deps.cache, url, response);
+  const outcome = await interpret(response, ref, path);
+
+  // Cached after interpreting, and only when the answer is one worth repeating.
+  // A rate-limited or failing upstream is a moment, not a fact about the
+  // repository, and caching it would strand every later visitor on the same
+  // error. A manifest that was refused for its size is not cached either --
+  // storing a body we just declined to accept is the cost the limit exists to
+  // avoid.
+  if (response.status === 404) {
+    await writeCache(deps.cache, url, 404, "");
+  } else if (outcome.ok) {
+    await writeCache(deps.cache, url, 200, outcome.value);
   }
 
-  return fromResponse(response, ref, path);
+  return outcome;
 }
 
-async function fromResponse(response: Response, ref: RepoRef, path: string): Promise<Result<string, FetchFailure>> {
+/** Maps one response, cached or live, onto the outcome it represents. */
+async function interpret(response: Response, ref: RepoRef, path: string): Promise<Result<string, FetchFailure>> {
   if (response.status === 404) return err({ kind: "not-found", ref, path });
   if (response.status === 429 || response.status === 403) {
     return err({ kind: "rate-limited", retryAfterSeconds: retryAfter(response) });
   }
   if (!response.ok) return err({ kind: "upstream-error", status: response.status });
+  return readBounded(response);
+}
 
-  const declared = Number(response.headers.get("content-length") ?? Number.NaN);
-  if (Number.isFinite(declared) && declared > MAX_BYTES) {
-    return err({ kind: "manifest-too-large", bytes: declared });
+/**
+ * Reads the body as text, refusing to hold more than the limit at any point.
+ *
+ * A declared length over the limit is refused before a single byte is read. An
+ * undeclared body is read in chunks and abandoned the moment it crosses the
+ * limit, cancelling the transfer rather than draining it. Checking the size
+ * after buffering the whole body would be a limit that costs exactly what it
+ * is meant to save.
+ */
+async function readBounded(response: Response): Promise<Result<string, FetchFailure>> {
+  const header = response.headers.get("content-length");
+  const declared = header === null ? Number.NaN : Number(header);
+  if (Number.isFinite(declared) && declared > MAX_MANIFEST_BYTES) {
+    await discard(response);
+    return err({ kind: "manifest-too-large", declaredBytes: declared });
   }
 
-  let text: string;
+  const body = response.body;
+  if (body === null) return ok("");
+
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+
   try {
-    text = await response.text();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value === undefined) continue;
+
+      total += value.byteLength;
+      if (total > MAX_MANIFEST_BYTES) {
+        await reader.cancel();
+        return err({ kind: "manifest-too-large", declaredBytes: null });
+      }
+      chunks.push(value);
+    }
   } catch (cause) {
     return err({ kind: "network-error", detail: cause instanceof Error ? cause.message : String(cause) });
   }
 
-  // A backstop for a response that declared no length.
-  if (text.length > MAX_BYTES) return err({ kind: "manifest-too-large", bytes: text.length });
+  return ok(new TextDecoder().decode(concat(chunks, total)));
+}
 
-  return ok(text);
+/**
+ * Ends a transfer we have decided not to read, rather than leaving it running
+ * to no purpose.
+ */
+async function discard(response: Response): Promise<void> {
+  try {
+    await response.body?.cancel();
+  } catch {
+    // A body that will not cancel is not a reason to fail the scan.
+  }
+}
+
+function concat(chunks: readonly Uint8Array[], total: number): Uint8Array {
+  const joined = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    joined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return joined;
 }
 
 /**
@@ -130,16 +198,19 @@ async function readCache(cache: Cache | undefined, url: string): Promise<Respons
   }
 }
 
-async function writeCache(cache: Cache | undefined, url: string, response: Response): Promise<void> {
+/**
+ * Stores the text already accepted, rather than a clone of the upstream
+ * response. Cloning would mean buffering the body a second time, and would
+ * reintroduce the unbounded read this module exists to avoid.
+ */
+async function writeCache(cache: Cache | undefined, url: string, status: number, text: string): Promise<void> {
   if (cache === undefined) return;
   try {
-    const body = await response.clone().arrayBuffer();
     const headers = new Headers({
       "cache-control": `max-age=${CACHE_SECONDS}`,
-      "content-type": response.headers.get("content-type") ?? "text/plain",
-      "content-length": String(body.byteLength),
+      "content-type": "text/plain; charset=utf-8",
     });
-    await cache.put(url, new Response(body, { status: response.status, headers }));
+    await cache.put(url, new Response(text, { status, headers }));
   } catch {
     // Caching is an optimisation. Failing to cache is not a failure to scan.
   }

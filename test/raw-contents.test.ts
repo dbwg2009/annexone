@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { type FetchDeps, fetchManifest, manifestUrl } from "../src/github/raw-contents.js";
+import { type FetchDeps, MAX_MANIFEST_BYTES, fetchManifest, manifestUrl } from "../src/github/raw-contents.js";
 import type { RepoRef } from "../src/github/repo-ref.js";
 
 const REF: RepoRef = { owner: "expressjs", repo: "express" };
@@ -91,16 +91,86 @@ describe("fetchManifest", () => {
   it("refuses a manifest that declares a length over the cap", async () => {
     const response = new Response("{}", { headers: { "content-length": String(3 * 1024 * 1024) } });
     const result = await fetchManifest(REF, "package.json", responding(response));
-    expect(result).toEqual({ ok: false, error: { kind: "manifest-too-large", bytes: 3 * 1024 * 1024 } });
+    expect(result).toEqual({ ok: false, error: { kind: "manifest-too-large", declaredBytes: 3 * 1024 * 1024 } });
   });
 
   it("refuses an oversized manifest that declared no length", async () => {
-    const response = new Response("x".repeat(2 * 1024 * 1024 + 1));
+    const response = new Response("x".repeat(MAX_MANIFEST_BYTES + 1));
     response.headers.delete("content-length");
     const result = await fetchManifest(REF, "package.json", responding(response));
-    expect(result.ok).toBe(false);
-    if (result.ok) return;
-    expect(result.error.kind).toBe("manifest-too-large");
+    expect(result).toEqual({ ok: false, error: { kind: "manifest-too-large", declaredBytes: null } });
+  });
+});
+
+describe("fetchManifest: the size limit is enforced while reading, not after", () => {
+  // A Worker has a small memory ceiling, so a body that would breach it must
+  // never be buffered whole in order to discover that it breaches it.
+
+  const CHUNK = 64 * 1024;
+  const OVERSIZED = 8 * 1024 * 1024;
+
+  /**
+   * A response whose body reports how much of it was actually pulled.
+   *
+   * Constructing a Response over a stream pulls one chunk eagerly, before
+   * fetchManifest is ever called, so every assertion below measures the bytes
+   * pulled from the moment of the call rather than the running total.
+   */
+  function metered(totalBytes: number, headers: Record<string, string> = {}) {
+    const meter = { pulled: 0, cancelled: false };
+    let remaining = totalBytes;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (remaining <= 0) {
+          controller.close();
+          return;
+        }
+        const size = Math.min(CHUNK, remaining);
+        remaining -= size;
+        meter.pulled += size;
+        controller.enqueue(new Uint8Array(size));
+      },
+      cancel() {
+        meter.cancelled = true;
+      },
+    });
+    const response = new Response(body, { headers });
+    return { response, meter };
+  }
+
+  it("refuses a declared over-limit length without reading the body, and ends the transfer", async () => {
+    const { response, meter } = metered(OVERSIZED, { "content-length": String(OVERSIZED) });
+    const before = meter.pulled;
+
+    const result = await fetchManifest(REF, "package.json", responding(response));
+
+    expect(result).toEqual({ ok: false, error: { kind: "manifest-too-large", declaredBytes: OVERSIZED } });
+    expect(meter.cancelled).toBe(true);
+    // Nothing is read to reach this decision. The single chunk that moves is
+    // the one already in flight when the body is cancelled -- taking it is the
+    // price of ending the transfer rather than leaving it running.
+    expect(meter.pulled - before).toBeLessThanOrEqual(CHUNK);
+    expect(meter.pulled).toBeLessThan(OVERSIZED / 2);
+  });
+
+  it("abandons an undeclared body at the limit instead of draining it", async () => {
+    const { response, meter } = metered(OVERSIZED);
+    const before = meter.pulled;
+
+    const result = await fetchManifest(REF, "package.json", responding(response));
+
+    expect(result).toEqual({ ok: false, error: { kind: "manifest-too-large", declaredBytes: null } });
+    expect(meter.cancelled).toBe(true);
+    // The limit, plus the chunk that crosses it, plus the one the reader holds
+    // ahead. Nothing beyond that, and far short of the whole body.
+    expect(meter.pulled - before).toBeLessThanOrEqual(MAX_MANIFEST_BYTES + 2 * CHUNK);
+    expect(meter.pulled).toBeLessThan(OVERSIZED / 2);
+  });
+
+  it("reads a manifest that sits just under the limit", async () => {
+    const body = "x".repeat(MAX_MANIFEST_BYTES);
+    const result = await fetchManifest(REF, "package.json", responding(new Response(body)));
+    expect(result).toEqual({ ok: true, value: body });
   });
 });
 
@@ -146,6 +216,32 @@ describe("fetchManifest: caching", () => {
     await fetchManifest({ owner: "honojs", repo: "hono" }, "package.json", deps);
 
     expect(upstream).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not cache a manifest it refused for its size", async () => {
+    // Storing a body we just declined to accept is the cost the limit exists
+    // to avoid.
+    const cache = fakeCache();
+    const oversized = () =>
+      new Response("x".repeat(MAX_MANIFEST_BYTES + 1), { headers: { "content-length": String(3 * 1024 * 1024) } });
+    const upstream = vi.fn(async () => oversized());
+    const deps: FetchDeps = { fetch: upstream as unknown as typeof globalThis.fetch, cache };
+
+    await fetchManifest(REF, "package.json", deps);
+
+    expect(cache.size()).toBe(0);
+  });
+
+  it("does not cache an upstream error", async () => {
+    const cache = fakeCache();
+    const deps: FetchDeps = {
+      fetch: (async () => new Response("", { status: 503 })) as unknown as typeof globalThis.fetch,
+      cache,
+    };
+
+    await fetchManifest(REF, "package.json", deps);
+
+    expect(cache.size()).toBe(0);
   });
 
   it("still scans when the cache throws", async () => {

@@ -1,4 +1,5 @@
 import { html } from "hono/html";
+import { MAX_MANIFEST_BYTES } from "../github/raw-contents.js";
 import type { RepoRefFailure } from "../github/repo-ref.js";
 import { formatRepoRef } from "../github/repo-ref.js";
 import type { ScanFailure } from "../scan.js";
@@ -91,7 +92,14 @@ function describe(failure: PageFailure): { heading: string; body: ReturnType<typ
     case "manifest-too-large":
       return {
         heading: "package.json is too large to read",
-        body: html`<p>The file is ${failure.bytes} bytes. This service reads manifests up to 2 MiB.</p>`,
+        body: html`
+          <p>
+            ${failure.declaredBytes === null
+              ? html`The file did not declare a length, and reading it was abandoned at the limit.`
+              : html`The file is ${failure.declaredBytes} bytes.`}
+            This service reads manifests up to ${MAX_MANIFEST_BYTES} bytes.
+          </p>
+        `,
       };
 
     case "upstream-error":
